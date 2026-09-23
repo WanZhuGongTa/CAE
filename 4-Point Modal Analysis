@@ -1,0 +1,877 @@
+# -*- coding: utf-8 -*-
+"""
+ANSA + Nastran / OptiStruct SOL 111 四点法模态分析 (Bending, Torsion, Lateral)
+====================================================================
+★ v9 最终版：
+    [1] DLOAD 导入后自动重命名为 bending / torsion / lateral
+    [2] NSMADD 引用逻辑完全参考 NVH_IPI.py（复用取 max）
+    [3] 修复 base.SetEntityName 报错（_set_entity_name_safe 兼容函数）
+    [4] 加入 PARAM,AMSES,YES 和 PARAM,CHECKEL,NO
+    [5] 四点法工况（弯曲、扭转、前端横摆Y向）
+    [6] 自动识别 NSM 与 MPC/RBE2/RBE3
+"""
+
+import os
+import tempfile
+
+import ansa
+from ansa import base
+from ansa import constants
+from ansa import guitk
+
+_STATE = {
+    'nodes_4pt':        [],
+    'dareas':           [],
+    'rload1s':          [],
+    'tabled_ent':       None,
+    'freq1_sid':        None,
+    'tabdmp1_tid':      None,
+    'eigl_sid':         None,
+    'out_widget':       None,
+    'eigr_type_widget': None,
+}
+
+# ---------------------------------------------------------------------------
+#  ANSA 入口
+# ---------------------------------------------------------------------------
+@ansa.session.defbutton("Structure Tool", "4-Point Modal Analysis (SOL 111)")
+def four_point_modal_analysis():
+    try:
+        window()
+    except Exception as e:
+        _warn('窗口创建失败：{}'.format(e))
+
+
+# ---------------------------------------------------------------------------
+#  主窗口
+# ---------------------------------------------------------------------------
+def window():
+    win    = guitk.BCWindowCreate('4-Point Modal Analysis (SOL 111)',
+                                  guitk.constants.BCOnExitDestroy)
+    layout = guitk.BCGridLayoutCreate(win, 18, 2)
+
+    freq_label = guitk.BCLabelCreate(layout, 'FREQ1 (F1, DF, NDF):')
+    freq_edit  = guitk.BCLineEditCreate(layout, '1.0, 1.0, 199')
+
+    damp_label = guitk.BCLabelCreate(layout, 'Modal Damping Ratio:')
+    damp_edit  = guitk.BCLineEditCreateDouble(layout, 0.06)
+
+    eigr_type_label = guitk.BCLabelCreate(layout, 'Modes Method (EIGRL/EIGRA):')
+    eigr_type_edit  = guitk.BCLineEditCreate(layout, 'EIGRL')
+
+    eigl_label = guitk.BCLabelCreate(layout, 'Method Upper Freq (Hz):')
+    eigl_edit  = guitk.BCLineEditCreateDouble(layout, 500.0)
+
+    tab_label = guitk.BCLabelCreate(layout, 'TABLED1 (x1,y1,x2,y2):')
+    tab_edit  = guitk.BCLineEditCreate(layout, '0, 1, 1000, 1')
+
+    out_label = guitk.BCLabelCreate(layout, 'Output Type (DISP/VELO/ACCEL):')
+    out_edit  = guitk.BCLineEditCreate(layout, 'A')
+
+    _STATE['out_widget']       = ('edit', out_edit)
+    _STATE['eigr_type_widget'] = ('edit', eigr_type_edit)
+
+    inputs = (freq_edit, damp_edit, eigr_type_edit, eigl_edit, tab_edit)
+
+    btn_init   = guitk.BCPushButtonCreate(layout, '0. Init Common Cards',
+                                          init_common_cards, inputs)
+    btn_nodes  = guitk.BCPushButtonCreate(layout, '1. Pick 4 Nodes & Create DAREA',
+                                          on_darea_nodes_4points, None)
+    btn_rload1 = guitk.BCPushButtonCreate(layout, '2. Create RLOAD & DLOAD',
+                                          create_rload1_dload, None)
+    btn_hdr    = guitk.BCPushButtonCreate(layout, '3. Create Header',
+                                          create_header, None)
+    btn_clear  = guitk.BCPushButtonCreate(layout, '4. Clear All',
+                                          _clear_all_data, None)
+
+    align_lbl = guitk.constants.BCAlignVCenter + guitk.constants.BCAlignLeft
+    align_c   = guitk.constants.BCAlignVCenter + guitk.constants.BCAlignHCenter
+
+    guitk.BCGridLayoutAddWidget(layout, freq_label,      0, 0, align_lbl)
+    guitk.BCGridLayoutAddWidget(layout, freq_edit,       1, 0, align_lbl)
+    guitk.BCGridLayoutAddWidget(layout, damp_label,      2, 0, align_lbl)
+    guitk.BCGridLayoutAddWidget(layout, damp_edit,       3, 0, align_lbl)
+    guitk.BCGridLayoutAddWidget(layout, eigr_type_label, 4, 0, align_lbl)
+    guitk.BCGridLayoutAddWidget(layout, eigr_type_edit,  5, 0, align_lbl)
+    guitk.BCGridLayoutAddWidget(layout, eigl_label,      6, 0, align_lbl)
+    guitk.BCGridLayoutAddWidget(layout, eigl_edit,       7, 0, align_lbl)
+    guitk.BCGridLayoutAddWidget(layout, tab_label,       8, 0, align_lbl)
+    guitk.BCGridLayoutAddWidget(layout, tab_edit,        9, 0, align_lbl)
+    guitk.BCGridLayoutAddWidget(layout, out_label,      10, 0, align_lbl)
+    guitk.BCGridLayoutAddWidget(layout, out_edit,       11, 0, align_lbl)
+
+    guitk.BCGridLayoutAddWidget(layout, btn_init,   12, 0, align_c)
+    guitk.BCGridLayoutAddWidget(layout, btn_nodes,  13, 0, align_c)
+    guitk.BCGridLayoutAddWidget(layout, btn_rload1, 14, 0, align_c)
+    guitk.BCGridLayoutAddWidget(layout, btn_hdr,    15, 0, align_c)
+    guitk.BCGridLayoutAddWidget(layout, btn_clear,  16, 0, align_c)
+
+    guitk.BCShow(win)
+    return 1
+
+
+# ---------------------------------------------------------------------------
+#  基础工具
+# ---------------------------------------------------------------------------
+def _warn(msg):
+    try:
+        guitk.BCMessageWindowCreate(guitk.constants.BCMessageBoxWarning, str(msg), True)
+    except Exception:
+        print('[WARN] ' + str(msg))
+
+
+def _info(msg):
+    try:
+        guitk.BCMessageWindowCreate(guitk.constants.BCMessageBoxInformation, str(msg), True)
+    except Exception:
+        print('[INFO] ' + str(msg))
+
+
+def _clear_selection():
+    try:
+        fn = getattr(base, 'ClearSelection', None)
+        if fn:
+            fn()
+    except Exception:
+        pass
+
+
+def _pick_grids():
+    _clear_selection()
+    try:
+        base.SetPickMethod(base.constants.ENT_SELECTION)
+    except Exception:
+        pass
+    try:
+        nodes = base.PickEntities(constants.NASTRAN, 'GRID')
+    except Exception as e:
+        print('[DBG] PickEntities failed: {}'.format(e))
+        return []
+    return list(nodes) if nodes else []
+
+
+def _collect(etype):
+    try:
+        return base.CollectEntities(constants.NASTRAN, None, etype)
+    except Exception:
+        return []
+
+
+def _get_card_sid(ent, *names):
+    if ent is None:
+        return None
+    names = list(names) if names else ['SID', 'TID', 'ID']
+    for fn in names:
+        try:
+            vals = base.GetEntityCardValues(constants.NASTRAN, ent, (fn,))
+        except Exception:
+            continue
+        if not vals:
+            continue
+        v = vals.get(fn)
+        if v is None or v == '':
+            continue
+        return getattr(v, '_id', v)
+    return getattr(ent, '_id', None)
+
+
+def _get_entity_name(ent):
+    if ent is None:
+        return None
+    try:
+        nm = base.GetEntityName(ent)
+        if nm:
+            return nm
+    except Exception:
+        pass
+    try:
+        nm = base.GetEntityCardValues(
+            constants.NASTRAN, ent, ('Name',)).get('Name')
+        if nm:
+            return nm
+    except Exception:
+        pass
+    return None
+
+
+# ---------------------------------------------------------------------------
+#  ★ 安全设置实体名称（多版本兼容，修复 base.SetEntityName 报错）
+# ---------------------------------------------------------------------------
+def _set_entity_name_safe(ent, name):
+    # 方法1：base.SetEntityName（若存在）
+    if hasattr(base, 'SetEntityName'):
+        try:
+            base.SetEntityName(ent, name)
+            return True
+        except Exception as e:
+            print('[DBG] SetEntityName failed: {}'.format(e))
+
+    # 方法2：base.SetEntityCardValues
+    for field in ('Name', 'NAME', 'name'):
+        try:
+            base.SetEntityCardValues(constants.NASTRAN, ent, {field: name})
+            try:
+                check = base.GetEntityCardValues(
+                    constants.NASTRAN, ent, (field,))
+                if check and check.get(field) == name:
+                    return True
+            except Exception:
+                pass
+        except Exception as e:
+            print('[DBG] SetEntityCardValues({}) failed: {}'.format(field, e))
+
+    # 方法3：其他可能的名字接口
+    for fn_name in ('SetName', 'SetTitle', 'SetLabel'):
+        if hasattr(base, fn_name):
+            try:
+                getattr(base, fn_name)(ent, name)
+                return True
+            except Exception as e:
+                print('[DBG] {} failed: {}'.format(fn_name, e))
+
+    print('[ERR] 所有命名方式都失败: {}'.format(name))
+    return False
+
+
+def _get_output_keyword():
+    kind_w = _STATE.get('out_widget')
+    if not kind_w:
+        return 'ACCELERATION'
+    _, w = kind_w
+    try:
+        txt = guitk.BCLineEditGetText(w) or ''
+    except Exception:
+        txt = ''
+    low = str(txt).strip().lower()
+    if low.startswith('d'):
+        return 'DISPLACEMENT'
+    if low.startswith('v'):
+        return 'VELOCITY'
+    return 'ACCELERATION'
+
+
+def _get_eigr_type():
+    kind_w = _STATE.get('eigr_type_widget')
+    if not kind_w:
+        return 'EIGRL'
+    _, w = kind_w
+    try:
+        txt = guitk.BCLineEditGetText(w) or ''
+    except Exception:
+        txt = ''
+    return 'EIGRA' if str(txt).strip().upper().startswith('EIGRA') else 'EIGRL'
+
+
+def _import_bulk_text(bulk_text, tag='bulk'):
+    if not bulk_text or not bulk_text.strip():
+        return True
+    tmp = os.path.join(tempfile.gettempdir(), '_{}.nas'.format(tag))
+    try:
+        with open(tmp, 'w') as f:
+            f.write(bulk_text)
+        r = base.InputNastran(tmp)
+        print('[DBG] import {} -> {}'.format(tag, r))
+        return True
+    except Exception as e:
+        print('[ERR] import {} failed: {}'.format(tag, e))
+        return False
+    finally:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+#  ★ NSM 自动识别逻辑（完全参考 NVH_IPI.py 原版）
+# ---------------------------------------------------------------------------
+def _nsm_get_sid_from_card(ent, field='SID'):
+    if ent is None:
+        return None
+    try:
+        vals = base.GetEntityCardValues(constants.NASTRAN, ent, (field,))
+    except Exception:
+        return None
+    v = vals.get(field)
+    if v is None or v == '':
+        return None
+    v = getattr(v, '_id', v)
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _nsm_ensure_nsmadd():
+    """返回 CEND 中 NSM 关键字使用的 SID（或 None）。NSMADD 通过 BULK 导入。
+    ★ NSMADD 是独立实体，不会被 create_header 删除 Header 时误删。
+    ★ 复用已有 NSMADD 时，与参考代码 NVH_IPI.py 完全一致：取 max。"""
+    nsm_sids = []
+    for ent in _collect('NSM'):
+        sid = _nsm_get_sid_from_card(ent, 'SID')
+        if sid is not None and sid not in nsm_sids:
+            nsm_sids.append(sid)
+
+    nsmadd_sids = []
+    for ent in _collect('NSMADD'):
+        sid = _nsm_get_sid_from_card(ent, 'SID')
+        if sid is not None:
+            nsmadd_sids.append(sid)
+
+    # ★ 与参考代码完全一致：复用已有 NSMADD 时取 max
+    if nsmadd_sids:
+        print('[DBG] 复用已有 NSMADD SID 列表: {}，取 max = {}'
+              .format(nsmadd_sids, max(nsmadd_sids)))
+        return max(nsmadd_sids)
+
+    if not nsm_sids:
+        print('[DBG] 未检测到 NSM 卡片，跳过 NSM 处理。')
+        return None
+
+    used = set(nsm_sids) | set(nsmadd_sids)
+    new_sid = 1
+    while new_sid in used:
+        new_sid += 1
+
+    fields = [str(new_sid)] + [str(s) for s in nsm_sids]
+    lines = ['BEGIN BULK']
+    first = fields[:8]
+    lines.append('NSMADD,' + ','.join(first))
+    rest = fields[8:]
+    while rest:
+        chunk = rest[:8]
+        lines.append('+,' + ','.join(chunk))
+        rest = rest[8:]
+    lines.append('ENDDATA')
+
+    if _import_bulk_text('\n'.join(lines) + '\n', 'nsmadd'):
+        print('[DBG] 成功生成 NSMADD，SID = {}，包含 NSM: {}'
+              .format(new_sid, nsm_sids))
+        return new_sid
+    return None
+
+
+# ---------------------------------------------------------------------------
+#  ★ MPC 自动识别逻辑
+# ---------------------------------------------------------------------------
+def _mpc_ensure_in_bulk():
+    mpc_sids = []
+    rbe_count = 0
+    for etype in ('MPC', 'RBE2', 'RBE3'):
+        try:
+            ents = _collect(etype)
+            for ent in ents:
+                sid = _get_card_sid(ent, 'SID')
+                if etype == 'MPC':
+                    if sid is not None and sid not in mpc_sids:
+                        mpc_sids.append(sid)
+                else:
+                    rbe_count += 1
+        except Exception as e:
+            print('[DBG] 扫描 {} 失败: {}'.format(etype, e))
+    print('[DBG] MPC 自动识别: 显式MPC={}, RBE2/3数量={}'
+          .format(mpc_sids, rbe_count))
+    return mpc_sids, rbe_count
+
+
+# ---------------------------------------------------------------------------
+#  [0] Init Common Cards
+# ---------------------------------------------------------------------------
+def _pad8(s):
+    return '{:<8}'.format(str(s))[:8]
+
+
+def _collect_used_sids(etype_list):
+    used = set()
+    for etype in etype_list:
+        for ent in _collect(etype):
+            sid = _get_card_sid(ent)
+            if sid is None:
+                continue
+            try:
+                used.add(int(sid))
+            except (TypeError, ValueError):
+                pass
+    return used
+
+
+def _next_free_sid(etype_list):
+    used = _collect_used_sids(etype_list)
+    n = 1
+    while n in used:
+        n += 1
+    return n
+
+
+def _allocate_common_sids(eigr_type='EIGRL'):
+    tabled_sid = _next_free_sid(['TABLED1'])
+    tabdmp_sid = _next_free_sid(['TABDMP1', 'TABDMP', 'TABDMP0'])
+    freq_sid   = _next_free_sid(['FREQ1', 'FREQ'])
+    eigl_sid   = _next_free_sid(['EIGRA'] if eigr_type == 'EIGRA'
+                                else ['EIGRL', 'EIGR'])
+    return tabled_sid, tabdmp_sid, freq_sid, eigl_sid
+
+
+def _build_common_cards_nas(tabled_sid, tabdmp_sid, freq_sid, eigl_sid,
+                            f1, df, ndf, damp, v2, tx1, ty1, tx2, ty2,
+                            eigr_type='EIGRL'):
+    lines = ['BEGIN BULK']
+    lines.append(_pad8('TABLED1') + _pad8(str(tabled_sid)) +
+                 _pad8('LINEAR') + _pad8('LINEAR'))
+    lines.append('+' + ' ' * 7 +
+                 _pad8(tx1) + _pad8(ty1) + _pad8(tx2) + _pad8(ty2))
+    lines.append('+' + ' ' * 7 + _pad8('ENDT'))
+
+    lines.append(_pad8('TABDMP1') + _pad8(str(tabdmp_sid)) + _pad8('G'))
+    lines.append('+' + ' ' * 7 +
+                 _pad8(tx1) + _pad8(damp) + _pad8(tx2) + _pad8(damp))
+    lines.append('+' + ' ' * 7 + _pad8('ENDT'))
+
+    lines.append('FREQ1,{},{},{},{}'.format(freq_sid, f1, df, ndf))
+
+    if eigr_type == 'EIGRA':
+        lines.append('EIGRA,{},0.0,{}'.format(eigl_sid, v2))
+    else:
+        lines.append('EIGRL,{},0.0,{}'.format(eigl_sid, v2))
+
+    lines.append('ENDDATA')
+    return '\n'.join(lines) + '\n'
+
+
+def _find_cards_in_model(eigr_type='EIGRL'):
+    tabs = _collect('TABLED1') or _collect('TABLED')
+    if tabs:
+        _STATE['tabled_ent'] = tabs[0]
+
+    for name in ('TABDMP1', 'TABDMP', 'TABDMP0'):
+        ents = _collect(name)
+        if ents:
+            _STATE['tabdmp1_tid'] = _get_card_sid(
+                ents[0], 'TID', 'SID', 'ID')
+            break
+
+    for name in ('FREQ1', 'FREQ'):
+        ents = _collect(name)
+        if ents:
+            _STATE['freq1_sid'] = _get_card_sid(
+                ents[0], 'SID', 'TID', 'ID')
+            break
+
+    search = ['EIGRA', 'EIGRL', 'EIGR'] if eigr_type == 'EIGRA' \
+        else ['EIGRL', 'EIGR', 'EIGRA']
+    for name in search:
+        ents = _collect(name)
+        if ents:
+            _STATE['eigl_sid'] = _get_card_sid(
+                ents[0], 'SID', 'TID', 'ID')
+            break
+
+
+def init_common_cards(w, data):
+    try:
+        freq_edit, damp_edit, eigr_type_edit, eigl_edit, tab_edit = data
+
+        parts = [p.strip()
+                 for p in guitk.BCLineEditGetText(freq_edit).split(',')]
+        if len(parts) != 3:
+            _warn('FREQ1 格式应为 "F1, DF, NDF"')
+            return
+        f1, df, ndf = float(parts[0]), float(parts[1]), int(float(parts[2]))
+
+        damp = guitk.BCLineEditGetDouble(damp_edit)
+        if damp <= 0:
+            _warn('阻尼比必须大于 0')
+            return
+
+        eigr_type = _get_eigr_type()
+
+        v2 = guitk.BCLineEditGetDouble(eigl_edit)
+        if v2 <= 0:
+            _warn('上限频率必须大于 0')
+            return
+
+        parts_t = [p.strip()
+                   for p in guitk.BCLineEditGetText(tab_edit).split(',')]
+        if len(parts_t) != 4:
+            _warn('TABLED1 格式应为 "x1, y1, x2, y2"')
+            return
+        tx1, ty1, tx2, ty2 = [float(p) for p in parts_t]
+
+        for etype in ('TABLED1', 'TABLED', 'TABDMP', 'TABDMP1',
+                      'FREQ', 'FREQ1', 'EIGRL', 'EIGR', 'EIGRA'):
+            for ent in _collect(etype):
+                try:
+                    base.DeleteEntity(ent)
+                except Exception:
+                    pass
+
+        tabled_sid, tabdmp_sid, freq_sid, eigl_sid = \
+            _allocate_common_sids(eigr_type)
+        _STATE['freq1_sid']   = freq_sid
+        _STATE['tabdmp1_tid'] = tabdmp_sid
+        _STATE['eigl_sid']    = eigl_sid
+
+        nas_text = _build_common_cards_nas(
+            tabled_sid, tabdmp_sid, freq_sid, eigl_sid,
+            f1, df, ndf, damp, v2, tx1, ty1, tx2, ty2, eigr_type)
+        _import_bulk_text(nas_text, 'init_cards')
+        _find_cards_in_model(eigr_type)
+
+        _info('公共卡片初始化成功。\n模态方法 = {}\nSID = {}'
+              .format(eigr_type, eigl_sid))
+    except Exception as e:
+        import traceback
+        print(traceback.format_exc())
+        _warn('初始化失败：{}'.format(e))
+
+
+# ---------------------------------------------------------------------------
+#  [1] 拾取4点并建立 DAREA
+# ---------------------------------------------------------------------------
+def _create_loadset(name):
+    try:
+        ls = base.CreateEntity(
+            constants.NASTRAN, 'LOAD_SET', {'Name': name})
+        if ls is not None:
+            return ls
+    except Exception:
+        pass
+    return None
+
+
+def _create_darea(nid, c_str, loadset, name):
+    fields = {
+        'SID': loadset, 'by': 'node', 'P': nid,
+        'C': c_str, 'A': 1.0, 'Name': name,
+    }
+    ent, report = base.CreateEntity(
+        constants.NASTRAN, 'DAREA', fields, debug=constants.REPORT_ALL)
+    if ent is None:
+        print('[ERR] DAREA failed: nid={}, C={!r}'.format(nid, c_str))
+    return ent
+
+
+def on_darea_nodes_4points(w, data):
+    try:
+        nodes = _pick_grids()
+        if not nodes:
+            _warn('未选中任何节点。')
+            return
+        if len(nodes) != 4:
+            _warn('必须拾取刚好 4 个节点！当前拾取了 {} 个。'
+                  .format(len(nodes)))
+            return
+
+        nids = []
+        for node in nodes:
+            nid = base.GetEntityCardValues(
+                constants.NASTRAN, node, ('NID',)).get('NID')
+            nids.append(nid)
+
+        _STATE['nodes_4pt'] = nids
+        print('[DBG] 拾取的4个节点 (左前, 右前, 左后, 右后): {}'.format(nids))
+
+        for d in _STATE['dareas']:
+            try:
+                base.DeleteEntity(d['darea_entity'])
+            except Exception:
+                pass
+        _STATE['dareas'] = []
+
+        # 1. 4个点 Z 向 DAREA
+        for nid in nids:
+            ls_name = 'PT_{}_Z'.format(nid)
+            ls = _create_loadset(ls_name)
+            if ls:
+                darea = _create_darea(nid, '3: Fz', ls, ls_name)
+                if darea:
+                    _STATE['dareas'].append({
+                        'node_id': nid,
+                        'loadset_name': ls_name,
+                        'loadset_id': getattr(ls, '_id', None),
+                        'loadset': ls,
+                        'darea_entity': darea,
+                        'dir': 'Z',
+                    })
+
+        # 2. 前两个点 Y 向 DAREA
+        for nid in nids[:2]:
+            ls_name = 'PT_{}_Y'.format(nid)
+            ls = _create_loadset(ls_name)
+            if ls:
+                darea = _create_darea(nid, '2: Fy', ls, ls_name)
+                if darea:
+                    _STATE['dareas'].append({
+                        'node_id': nid,
+                        'loadset_name': ls_name,
+                        'loadset_id': getattr(ls, '_id', None),
+                        'loadset': ls,
+                        'darea_entity': darea,
+                        'dir': 'Y',
+                    })
+
+        _info('成功为4个节点建立Z向DAREA，为前2个节点建立Y向DAREA。\n共 {} 个。'
+              .format(len(_STATE['dareas'])))
+    except Exception as e:
+        import traceback
+        print(traceback.format_exc())
+        _warn('DAREA 建立失败：{}'.format(e))
+
+
+# ---------------------------------------------------------------------------
+#  [2] 建立 RLOAD1 和 DLOAD
+# ---------------------------------------------------------------------------
+def _create_rload1_for_darea(darea, tabled_ent):
+    fields = {
+        'Name': darea['loadset_name'],
+        'SID': darea['loadset'],
+        'EXCITEID': darea['loadset'],
+        'TC': tabled_ent,
+        'TD': 0,
+        'TYPE': '0 Load',
+    }
+    ent, report = base.CreateEntity(
+        constants.NASTRAN, 'RLOAD1', fields, debug=constants.REPORT_ALL)
+    if ent is None:
+        print('[ERR] RLOAD1 failed for {}'.format(darea['loadset_name']))
+    return ent
+
+
+def _create_dload(sid, name, rload_sids, coeffs):
+    lines = ['BEGIN BULK']
+    line = 'DLOAD,{},1.0'.format(sid)
+    for r_sid, coeff in zip(rload_sids, coeffs):
+        line += ',1.0,{},{}'.format(r_sid, coeff)
+    lines.append(line)
+    lines.append('ENDDATA')
+    _import_bulk_text('\n'.join(lines) + '\n', 'dload_{}'.format(name))
+
+    # ★ v9 新增：导入后，根据 SID 找到刚建好的 DLOAD 并重命名
+    for ent in _collect('DLOAD'):
+        try:
+            v = base.GetEntityCardValues(constants.NASTRAN, ent, ('SID',)).get('SID')
+            actual_sid = getattr(v, '_id', v)
+            if actual_sid == sid:
+                _set_entity_name_safe(ent, name)
+                print('[DBG] DLOAD {} 已重命名为 {!r}'.format(sid, name))
+                break
+        except Exception as e:
+            print('[DBG] 重命名 DLOAD 失败: {}'.format(e))
+
+
+def create_rload1_dload(w, data):
+    try:
+        if not _STATE['dareas']:
+            _warn('请先拾取节点并建立 DAREA。')
+            return
+        if _STATE['tabled_ent'] is None:
+            _find_cards_in_model(_get_eigr_type())
+        if _STATE['tabled_ent'] is None:
+            _warn('缺少 TABLED1，请先 Init Common Cards。')
+            return
+
+        _STATE['rload1s'] = []
+        for darea in _STATE['dareas']:
+            rload = _create_rload1_for_darea(
+                darea, _STATE['tabled_ent'])
+            if rload:
+                _STATE['rload1s'].append({
+                    'rload_entity': rload,
+                    'loadset_name': darea['loadset_name'],
+                    'loadset_id': darea['loadset_id'],
+                    'node_id': darea['node_id'],
+                    'dir': darea['dir'],
+                })
+
+        rload_z = [r['loadset_id'] for r in _STATE['rload1s']
+                   if r['dir'] == 'Z']
+        rload_y = [r['loadset_id'] for r in _STATE['rload1s']
+                   if r['dir'] == 'Y']
+
+        if len(rload_z) != 4 or len(rload_y) != 2:
+            _warn('载荷数量不对，请检查 DAREA 拾取步骤。')
+            return
+
+        # DLOAD 101: Bending - 4点Z向同相
+        _create_dload(101, 'bending', rload_z, [1.0, 1.0, 1.0, 1.0])
+        # DLOAD 102: Torsion - 4点Z向反相
+        _create_dload(102, 'torsion', rload_z, [-1.0, 1.0, 1.0, -1.0])
+        # DLOAD 103: Lateral - 前2点Y向 (+1.0, +1.0)
+        _create_dload(103, 'lateral', rload_y, [1.0, 1.0])
+
+        _info('RLOAD1 和 3 个 DLOAD 创建成功！\n'
+              'DLOAD 101: bending (4点Z向同相)\n'
+              'DLOAD 102: torsion (4点Z向反相)\n'
+              'DLOAD 103: lateral (前2点Y向+1.0,+1.0)')
+    except Exception as e:
+        import traceback
+        print(traceback.format_exc())
+        _warn('RLOAD/DLOAD 失败：{}'.format(e))
+
+
+# ---------------------------------------------------------------------------
+#  [3] 建立 Header
+# ---------------------------------------------------------------------------
+def create_header(w, data):
+    try:
+        if not _STATE['rload1s']:
+            _warn('请先执行 "2. Create RLOAD & DLOAD"。')
+            return
+        if (_STATE['freq1_sid'] is None or
+                _STATE['eigl_sid'] is None or
+                _STATE['tabdmp1_tid'] is None):
+            _warn('缺少公共卡片，请先执行 "0. Init Common Cards"。')
+            return
+
+        out_kw    = _get_output_keyword()
+        eigr_type = _get_eigr_type()
+
+        # ★ 自动识别 NSM
+        nsm_sid = _nsm_ensure_nsmadd()
+
+        # ★ 自动识别 MPC / RBE2 / RBE3
+        mpc_sids, rbe_count = _mpc_ensure_in_bulk()
+
+        for h in _collect('Nastran Header'):
+            try:
+                base.DeleteEntity(h)
+            except Exception:
+                pass
+        for s in _collect('SET'):
+            nm = _get_entity_name(s)
+            if nm and nm.startswith('RESP_'):
+                try:
+                    base.DeleteEntity(s)
+                except Exception:
+                    pass
+
+        nids = _STATE['nodes_4pt']
+        if not nids:
+            _warn('找不到拾取的节点信息。')
+            return
+
+        used_sids = _collect_used_sids(
+            ['SET', 'NSET', 'ESET', 'BSET'])
+        set_sid = _next_free_sid(['SET'])
+
+        set_ent = base.CreateEntity(constants.NASTRAN, 'SET')
+        base.SetEntityCardValues(
+            constants.NASTRAN, set_ent, {'SID': set_sid})
+        # ★ 使用兼容函数代替 base.SetEntityName
+        _set_entity_name_safe(set_ent, 'RESP_4PTS')
+
+        grids = []
+        for g in _collect('GRID'):
+            v = base.GetEntityCardValues(
+                constants.NASTRAN, g, ('NID',)).get('NID')
+            if v in nids:
+                grids.append(g)
+
+        if grids:
+            base.AddToSet(set_ent, grids)
+
+        # ===== Header 文本 =====
+        lines = [
+            'SOL 111',
+            'CEND',
+            '$=======================================================================',
+            'ECHO = NONE',
+            'FREQ = {}'.format(_STATE['freq1_sid']),
+        ]
+        if nsm_sid is not None:
+            lines.append('NSM = {}'.format(nsm_sid))
+        if mpc_sids:
+            lines.append('MPC = {}'.format(mpc_sids[0]))
+
+        lines += [
+            '$',
+            'METHOD(STRUCTURE) = {}'.format(_STATE['eigl_sid']),
+            'SDAMPING(STRUCTURE) = {}'.format(_STATE['tabdmp1_tid']),
+            '$',
+            'SUBCASE 1',
+            'LABEL = bending',
+            'DLOAD = 101',
+            '{}(SORT2, PUNCH, PHASE) = {}'.format(out_kw, set_sid),
+            '$',
+            'SUBCASE 2',
+            'LABEL = torsion',
+            'DLOAD = 102',
+            '{}(SORT2, PUNCH, PHASE) = {}'.format(out_kw, set_sid),
+            '$',
+            'SUBCASE 3',
+            'LABEL = lateral',
+            'DLOAD = 103',
+            '{}(SORT2, PUNCH, PHASE) = {}'.format(out_kw, set_sid),
+            '$',
+            # ★ 按要求加入以下两个 PARAM
+            'PARAM,AMSES,YES',
+            'PARAM,CHECKEL,NO',
+            'PARAM,POST,-1',
+            'PARAM,AUTOSPC,YES',
+        ]
+
+        text = '\n'.join(lines)
+        print('[DBG] Header:\n{}'.format(text))
+
+        header = base.CreateEntity(constants.NASTRAN, 'Nastran Header')
+        if not header:
+            _warn('Header 创建失败。')
+            return
+        base.SetNastranHeaderText(header, text)
+        base.SetCurrentEntity(header)
+
+        nsm_msg = 'NSM = {}'.format(nsm_sid) if nsm_sid is not None else '无'
+        mpc_msg = 'MPC SID = {}'.format(mpc_sids) if mpc_sids \
+            else '无显式MPC'
+        if rbe_count > 0:
+            mpc_msg += ' (检测到 {} 个 RBE2/RBE3)'.format(rbe_count)
+
+        _info('Header 写入完成！\n'
+              'SUBCASE 1: bending  (DLOAD=101)\n'
+              'SUBCASE 2: torsion  (DLOAD=102)\n'
+              'SUBCASE 3: lateral  (DLOAD=103)\n'
+              '响应 SET: RESP_4PTS (SID={})\n'
+              'NSM状态: {}\n'
+              'MPC状态: {}\n'
+              '已添加参数: AMSES=YES, CHECKEL=NO'
+              .format(set_sid, nsm_msg, mpc_msg))
+    except Exception as e:
+        import traceback
+        print(traceback.format_exc())
+        _warn('Create Header 失败：{}'.format(e))
+
+
+# ---------------------------------------------------------------------------
+#  [4] Clear All
+# ---------------------------------------------------------------------------
+def _clear_all_data(w=None, data=None):
+    try:
+        for d in _STATE['dareas']:
+            try:
+                base.DeleteEntity(d['darea_entity'])
+            except Exception:
+                pass
+        for r in _STATE['rload1s']:
+            try:
+                base.DeleteEntity(r['rload_entity'])
+            except Exception:
+                pass
+        for h in _collect('Nastran Header'):
+            try:
+                base.DeleteEntity(h)
+            except Exception:
+                pass
+        for s in _collect('SET'):
+            nm = _get_entity_name(s)
+            if nm and nm.startswith('RESP_'):
+                try:
+                    base.DeleteEntity(s)
+                except Exception:
+                    pass
+
+        _STATE['dareas'] = []
+        _STATE['rload1s'] = []
+        _STATE['nodes_4pt'] = []
+        _info('已清除所有生成数据。')
+    except Exception as e:
+        _warn('清除失败：{}'.format(e))
