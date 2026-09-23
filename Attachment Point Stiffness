@@ -1,0 +1,181 @@
+import ansa
+from ansa import base
+from ansa import constants
+from ansa import guitk
+
+@ansa.session.defbutton("Structure Tool", "Mounting of Stiffness")
+def stiffness_analysis():
+    """
+    安装点静刚度分析前处理插件
+
+    第一步：创建加载力，每一个点需点击Create Force按钮一次，先选择孔边缘建立RBE2，
+            完成后选择三个点确定坐标系。
+    第二步：建立约束，点击Create SPC按钮，然后框选需要约束的点。
+    第三步：点击Create Header完成载荷步创建及头文件（SOL 101）。
+    """
+    window()
+    return
+
+def window():
+    """创建主窗口及控件"""
+    top_window = guitk.BCWindowCreate('Create Joint', guitk.constants.BCOnExitDestroy)
+    bc_grid_layout = guitk.BCGridLayoutCreate(top_window, 5, 1)
+
+    force_label = guitk.BCLabelCreate(bc_grid_layout, 'Force Magnitude:')
+    force_input = guitk.BCLineEditCreateDouble(bc_grid_layout, 200.0)
+
+    button_1 = guitk.BCPushButtonCreate(bc_grid_layout, 'Create Force', create_force, force_input)
+    button_2 = guitk.BCPushButtonCreate(bc_grid_layout, 'Create SPC', create_spc, None)
+    button_3 = guitk.BCPushButtonCreate(bc_grid_layout, 'Create Header', create_header, None)
+
+    guitk.BCGridLayoutAddWidget(bc_grid_layout, force_label, 0, 0,
+                                guitk.constants.BCAlignVCenter + guitk.constants.BCAlignHCenter)
+    guitk.BCGridLayoutAddWidget(bc_grid_layout, force_input, 1, 0,
+                                guitk.constants.BCAlignVCenter + guitk.constants.BCAlignHCenter)
+    guitk.BCGridLayoutAddWidget(bc_grid_layout, button_1, 2, 0,
+                                guitk.constants.BCAlignVCenter + guitk.constants.BCAlignHCenter)
+    guitk.BCGridLayoutAddWidget(bc_grid_layout, button_2, 3, 0,
+                                guitk.constants.BCAlignVCenter + guitk.constants.BCAlignHCenter)
+    guitk.BCGridLayoutAddWidget(bc_grid_layout, button_3, 4, 0,
+                                guitk.constants.BCAlignVCenter + guitk.constants.BCAlignHCenter)
+
+    guitk.BCShow(top_window)
+    return 1
+
+def create_force(w, data):
+    """
+    创建加载力：
+    1. 选择安装孔边缘节点，自动计算中心并建立RBE2。
+    2. 选择三个节点确定局部坐标系。
+    3. 在中心节点上创建FORCE载荷。
+    """
+    force_magnitude = guitk.BCLineEditGetDouble(data)
+    if force_magnitude <= 0:
+        guitk.BCMessageWindowCreate(guitk.constants.BCMessageBoxWarning, "力的大小必须大于0", True)
+        return
+
+    base.SetPickMethod(base.constants.LOOP_SELECTION)
+    nodes = base.PickNodes(constants.NASTRAN, ('SHELL', ))
+    if not nodes:
+        guitk.BCMessageWindowCreate(guitk.constants.BCMessageBoxWarning, "未选择任何节点", True)
+        return
+
+    elem_dicts = base.NodesToElements(nodes)
+    node_id_set = set()
+    sum_x1, sum_x2, sum_x3 = 0.0, 0.0, 0.0
+
+    for node in nodes:
+        node_vals = base.GetEntityCardValues(constants.NASTRAN, node, ('NID', 'X1', 'X2', 'X3'))
+        n_id = node_vals.get('NID')
+        x1 = node_vals.get('X1')
+        x2 = node_vals.get('X2')
+        x3 = node_vals.get('X3')
+        sum_x1 += x1
+        sum_x2 += x2
+        sum_x3 += x3
+        node_id_set.add(n_id)
+
+    node_num = len(node_id_set)
+    if node_num == 0:
+        guitk.BCMessageWindowCreate(guitk.constants.BCMessageBoxWarning, "未获取到节点信息", True)
+        return
+
+    average_x1 = sum_x1 / node_num
+    average_x2 = sum_x2 / node_num
+    average_x3 = sum_x3 / node_num
+
+    val = {'TYPE': 'GRID', 'X1': average_x1, 'X2': average_x2, 'X3': average_x3}
+    cog_node = base.CreateEntity(constants.NASTRAN, 'GRID', val)
+    cog_node_id = cog_node._id
+
+    all_node_ids = set()
+    for elem_list in elem_dicts.values():
+        for elem in elem_list:
+            ret = base.GetEntityCardValues(constants.NASTRAN, elem, ('G1', 'G2', 'G3', 'G4'))
+            for k in ret.values():
+                if k:
+                    all_node_ids.add(k)
+    all_node_ids = list(all_node_ids)
+    node_num2 = len(all_node_ids)
+
+    rbe2info = {'GN': cog_node_id, 'CM': 123456, 'No.of.Nodes': node_num2 + 1}
+    for idx, nid in enumerate(all_node_ids, start=1):
+        rbe2info['GM' + str(idx)] = nid
+    base.CreateEntity(constants.NASTRAN, 'RBE2', rbe2info)
+
+    base.SetPickMethod(base.constants.ENT_SELECTION)
+    sys_node_lst = base.PickEntities(constants.NASTRAN, 'GRID')
+    if len(sys_node_lst) != 3:
+        guitk.BCMessageWindowCreate(guitk.constants.BCMessageBoxWarning, "请选择三个节点确定坐标系", True)
+        return
+
+    sys_val = {'G1': sys_node_lst[0], 'G2': sys_node_lst[1], 'G3': sys_node_lst[2]}
+    sys = base.CreateEntity(constants.NASTRAN, 'CORD_NODES_R', sys_val)
+    sys_info = base.GetEntityCardValues(constants.NASTRAN, sys, ('CID',))
+    sys_id = sys_info.get('CID')
+
+    loads = base.CollectEntities(constants.NASTRAN, None, 'LOAD_SET')
+    load_num = len(loads)
+    force_info = {
+        'SID': load_num + 1,
+        'TYPE': 'FORCE',
+        'by': 'node',
+        'G': sys_node_lst[0],
+        'CID': sys_id,
+        'F': force_magnitude,
+        'Name': 'F' + str(load_num + 1),
+        'N2': 1
+    }
+    force = base.CreateEntity(constants.NASTRAN, 'FORCE', force_info)
+    base.SetEntityCardValues(constants.NASTRAN, force, {'SID->Name': 'F' + str(load_num + 1)})
+
+def create_spc(w, data):
+    """创建单点约束（SPC）"""
+    base.SetPickMethod(base.constants.ENT_SELECTION)
+    node_to_list = base.PickEntities(constants.NASTRAN, 'GRID')
+    if not node_to_list:
+        guitk.BCMessageWindowCreate(guitk.constants.BCMessageBoxWarning, "未选择任何节点", True)
+        return
+
+    node_set = base.CreateEntity(constants.NASTRAN, 'SET', {'Name': 'SPC'})
+    base.AddToSet(node_set, node_to_list)
+
+    loads = base.CollectEntities(constants.NASTRAN, None, 'LOAD_SET')
+    loads_num = len(loads)
+
+    spc = base.CreateEntity(constants.NASTRAN, 'SPC', {
+        'Name': 'SPC',
+        'G on set': node_set._id,
+        'by': 'set',
+        'D(G)': 0,
+        'C': 123456
+    })
+    base.SetEntityCardValues(constants.NASTRAN, spc, {
+        'SID->Name': 'SPC',
+        'SID->SID': loads_num + 1,
+        'SID': loads_num + 1
+    })
+
+def create_header(w, data):
+    """
+    创建载荷步及头文件（静力学 SOL 101）
+    """
+    loads = base.CollectEntities(constants.NASTRAN, None, 'LOAD_SET')
+    loads_num = len(loads)
+
+    header = base.CreateEntity(constants.NASTRAN, 'Nastran Header')
+    text = 'SOL 101\n'                     # 静力学求解
+    text += 'DISPLACEMENT=All\n'
+    text += 'STRESS=All\n'
+    text += 'STRAIN=All\n'
+
+    for load in loads:
+        text += 'SUBCASE ' + str(load._id) + '\n'
+        text += 'TITLE=' + load._name + '\n'
+        text += 'LOAD=' + str(load._id) + '\n'
+        text += 'SPC=' + str(loads_num + 1) + '\n'
+
+    text += 'PARAM, POST, -1'
+
+    base.SetNastranHeaderText(header, text)
+    base.SetCurrentEntity(header)
