@@ -1,32 +1,36 @@
 # -*- coding: utf-8 -*-
 """
-ANSA + Nastran SOL 111 NTF (Noise Transfer Function) 前处理插件（v4-fix-merge-v2）
+ANSA + Nastran SOL 111 VTF (Vibration Transfer Function) 前处理插件
 ====================================================================
 
-★ v4-fix-merge-v2 修复（相对 v4-fix-merge）：
-    [1] ★ PARAM + ACMODL 不再通过 InputNastran 导入，
-        直接写进 create_header 生成的 Header
-        —— 因为 ANSA 会把 PARAM / ACMODL 归到 Header 实体里，
-           而 create_header 会删除所有旧 Header，
-           导致之前通过 InputNastran 导入的卡片一起被删除。
-    [2] 移除 _ensure_params_in_bulk() 的所有调用
-    [3] init_common_cards 不再创建只含 PARAM/ACMODL 的额外 Header
+★ v13-fix-merge-v3 修复（相对 v13-fix-merge-v2）：
+    [1] ★ _rebuild_response_set() 中 AddToSet 由「一次性传列表 + 首个成功即 break」
+        改为「逐个 GRID 调用 AddToSet」——修复框选多个响应点时，
+        VTF_RESPONSE SET 里只写进第一个点的问题。
+        （与 NVH_ODS.py / NVH_NTF.py / NVH_Random Response.py /
+          NVH_Panel Contribution.py / NVH_Modal Contribution.py 的对应修复保持一致）
 
-★ v4-fix-merge 修复（保留）：
-    [1] Header 只写 CEND 段，不再写 BEGIN BULK / PARAM / NSMADD / ACMODL / ENDDATA
+★ v13-fix-merge-v2 修复（保留）：
+    [1] ★ PARAM 不再通过 InputNastran 导入，直接写进 create_header 生成的 Header
+        —— 因为 ANSA 会把 PARAM 归到 Header 实体里，
+           而 create_header 会删除所有旧 Header，
+           导致之前通过 InputNastran 导入的 PARAM 一起被删除。
+    [2] 移除 _ensure_params_in_bulk() 的所有调用
+    [3] init_common_cards 不再创建只含 PARAM 的额外 Header
+
+★ v13-fix-merge 修复（保留）：
+    [1] Header 只写 CEND 段，不再写 BEGIN BULK / NSMADD / ENDDATA
     [2] NSMADD 通过 InputNastran 导入 BULK（NSMADD 是独立实体，不会丢）
     [3] CEND 关键字顺序对齐 IPI：FREQ → NSM → METHOD → SDAMPING
     [4] 'FREQUENCY = X' 改为 'FREQ = X'
 
-★ v3 已有功能（NSM 智能处理）：
+★ v12 已有功能（NSM 智能处理）：
     · 模型里已有 NSMADD（任意 SID）→ 引用它，不新建
     · 模型里无 NSMADD，有 NSM → 新建 NSMADD，引用
     · 模型里无 NSM → 不加 NSM/NSMADD
 
-★ IPI 与 NTF 的响应点区别：
-    IPI：每个 SUBCASE 独立 SET（成员 = 该激励点 GRID 自己）。
-    NTF：所有 SUBCASE 共享一个 SET（成员 = 所有声腔响应点）。
-         名字 = 常量 'NTF_RESPONSE'。
+★ v2~v11 已有功能：
+    完整关键字、清除按钮、SET 名字兜底、去重、拾取预览等
 """
 
 import os
@@ -42,31 +46,29 @@ from ansa import guitk
 #  模块级状态
 # ---------------------------------------------------------------------------
 _STATE = {
-    'dareas':             [],
-    'rload1s':            [],
-    'tabled_ent':         None,
-    'freq1_sid':          None,
-    'eigl_struct_sid':    None,
-    'eigl_fluid_sid':     None,
-    'tabdmp1_struct_tid': None,
-    'tabdmp1_fluid_tid':  None,
-    'out_widget':         None,
-    'response_nids':      set(),
-    'response_set':       None,
-    'response_sid':       None,
-    '_params_done':       False,
+    'dareas':        [],
+    'rload1s':       [],
+    'tabled_ent':    None,
+    'freq1_sid':     None,
+    'tabdmp1_tid':   None,
+    'eigl_sid':      None,
+    'out_widget':    None,
+    'response_nids': set(),
+    'response_set':  None,
+    'response_sid':  None,
+    '_params_done':  False,
 }
 
 
-# 响应 SET 名字常量（NTF 用）
-RESPONSE_SET_NAME = 'NTF_RESPONSE'
+# VTF 响应 SET 名字常量
+RESPONSE_SET_NAME = 'VTF_RESPONSE'
 
 
 # ---------------------------------------------------------------------------
 #  ANSA 入口按钮
 # ---------------------------------------------------------------------------
-@ansa.session.defbutton("Structure Tool", "Noise Transfer Function")
-def noise_transfer_function():
+@ansa.session.defbutton("Structure Tool", "Vibration Transfer Function")
+def vibration_transfer_function():
     try:
         window()
     except Exception as e:
@@ -77,34 +79,28 @@ def noise_transfer_function():
 #  主窗口（2 列布局）
 # ---------------------------------------------------------------------------
 def window():
-    win    = guitk.BCWindowCreate('Noise Transfer Function (NTF)',
+    win    = guitk.BCWindowCreate('Vibration Transfer Function',
                                   guitk.constants.BCOnExitDestroy)
-    layout = guitk.BCGridLayoutCreate(win, 19, 2)
+    layout = guitk.BCGridLayoutCreate(win, 16, 2)
 
     freq_label = guitk.BCLabelCreate(layout, 'FREQ1 (F1, DF, NDF):')
     freq_edit  = guitk.BCLineEditCreate(layout, '1.0, 1.0, 299')
 
-    ds_label   = guitk.BCLabelCreate(layout, 'Structural Damping Ratio:')
-    ds_edit    = guitk.BCLineEditCreateDouble(layout, 0.06)
+    damp_label = guitk.BCLabelCreate(layout, 'Modal Damping Ratio:')
+    damp_edit  = guitk.BCLineEditCreateDouble(layout, 0.06)
 
-    es_label   = guitk.BCLabelCreate(layout, 'Structural EIGRL Upper Freq (Hz):')
-    es_edit    = guitk.BCLineEditCreateDouble(layout, 500.0)
-
-    df_label   = guitk.BCLabelCreate(layout, 'Fluid (Cavity) Damping Ratio:')
-    df_edit    = guitk.BCLineEditCreateDouble(layout, 0.12)
-
-    ef_label   = guitk.BCLabelCreate(layout, 'Fluid EIGRL Upper Freq (Hz):')
-    ef_edit    = guitk.BCLineEditCreateDouble(layout, 1000.0)
+    eigl_label = guitk.BCLabelCreate(layout, 'EIGRL Upper Freq (Hz):')
+    eigl_edit  = guitk.BCLineEditCreateDouble(layout, 500.0)
 
     tab_label  = guitk.BCLabelCreate(layout, 'TABLED1 (x1,y1,x2,y2):')
     tab_edit   = guitk.BCLineEditCreate(layout, '0, 1, 1000, 1')
 
     out_label  = guitk.BCLabelCreate(layout, 'Output Type (DISP/VELO/ACCEL):')
-    out_edit   = guitk.BCLineEditCreate(layout, 'D')   # NTF 默认位移
+    out_edit   = guitk.BCLineEditCreate(layout, 'A')
 
     _STATE['out_widget'] = ('edit', out_edit)
 
-    inputs = (freq_edit, ds_edit, es_edit, df_edit, ef_edit, tab_edit)
+    inputs = (freq_edit, damp_edit, eigl_edit, tab_edit)
 
     btn_init     = guitk.BCPushButtonCreate(layout, '0. Init Common Cards',
                                             init_common_cards, inputs)
@@ -112,7 +108,7 @@ def window():
                                             on_darea_nodes, None)
     btn_rload1   = guitk.BCPushButtonCreate(layout, '2. Create RLOAD',
                                             create_rload1, None)
-    btn_response = guitk.BCPushButtonCreate(layout, '3. Response Nodes (Cavity)',
+    btn_response = guitk.BCPushButtonCreate(layout, '3. Response Nodes',
                                             on_response_nodes, None)
     btn_hdr      = guitk.BCPushButtonCreate(layout, '4. Create Header',
                                             create_header, None)
@@ -129,36 +125,32 @@ def window():
 
     guitk.BCGridLayoutAddWidget(layout, freq_label,   0, 0, align_lbl)
     guitk.BCGridLayoutAddWidget(layout, freq_edit,    1, 0, align_lbl)
-    guitk.BCGridLayoutAddWidget(layout, ds_label,     2, 0, align_lbl)
-    guitk.BCGridLayoutAddWidget(layout, ds_edit,      3, 0, align_lbl)
-    guitk.BCGridLayoutAddWidget(layout, es_label,     4, 0, align_lbl)
-    guitk.BCGridLayoutAddWidget(layout, es_edit,      5, 0, align_lbl)
-    guitk.BCGridLayoutAddWidget(layout, df_label,     6, 0, align_lbl)
-    guitk.BCGridLayoutAddWidget(layout, df_edit,      7, 0, align_lbl)
-    guitk.BCGridLayoutAddWidget(layout, ef_label,     8, 0, align_lbl)
-    guitk.BCGridLayoutAddWidget(layout, ef_edit,      9, 0, align_lbl)
-    guitk.BCGridLayoutAddWidget(layout, tab_label,    10, 0, align_lbl)
-    guitk.BCGridLayoutAddWidget(layout, tab_edit,     11, 0, align_lbl)
-    guitk.BCGridLayoutAddWidget(layout, out_label,    12, 0, align_lbl)
-    guitk.BCGridLayoutAddWidget(layout, out_edit,     13, 0, align_lbl)
+    guitk.BCGridLayoutAddWidget(layout, damp_label,   2, 0, align_lbl)
+    guitk.BCGridLayoutAddWidget(layout, damp_edit,    3, 0, align_lbl)
+    guitk.BCGridLayoutAddWidget(layout, eigl_label,   4, 0, align_lbl)
+    guitk.BCGridLayoutAddWidget(layout, eigl_edit,    5, 0, align_lbl)
+    guitk.BCGridLayoutAddWidget(layout, tab_label,    6, 0, align_lbl)
+    guitk.BCGridLayoutAddWidget(layout, tab_edit,     7, 0, align_lbl)
+    guitk.BCGridLayoutAddWidget(layout, out_label,    8, 0, align_lbl)
+    guitk.BCGridLayoutAddWidget(layout, out_edit,     9, 0, align_lbl)
 
-    guitk.BCGridLayoutAddWidget(layout, btn_init,     14, 0, align_c)
-    guitk.BCGridLayoutAddWidget(layout, btn_nodes,    15, 0, align_c)
-    guitk.BCGridLayoutAddWidget(layout, btn_clr_1,    15, 1, align_c)
-    guitk.BCGridLayoutAddWidget(layout, btn_rload1,   16, 0, align_c)
-    guitk.BCGridLayoutAddWidget(layout, btn_clr_2,    16, 1, align_c)
-    guitk.BCGridLayoutAddWidget(layout, btn_response, 17, 0, align_c)
-    guitk.BCGridLayoutAddWidget(layout, btn_clr_3,    17, 1, align_c)
-    guitk.BCGridLayoutAddWidget(layout, btn_hdr,      18, 0, align_c)
-    guitk.BCGridLayoutAddWidget(layout, btn_clr_4,    18, 1, align_c)
-    guitk.BCGridLayoutAddWidget(layout, btn_clear,    19, 0, align_c)
+    guitk.BCGridLayoutAddWidget(layout, btn_init,     10, 0, align_c)
+    guitk.BCGridLayoutAddWidget(layout, btn_nodes,    11, 0, align_c)
+    guitk.BCGridLayoutAddWidget(layout, btn_clr_1,    11, 1, align_c)
+    guitk.BCGridLayoutAddWidget(layout, btn_rload1,   12, 0, align_c)
+    guitk.BCGridLayoutAddWidget(layout, btn_clr_2,    12, 1, align_c)
+    guitk.BCGridLayoutAddWidget(layout, btn_response, 13, 0, align_c)
+    guitk.BCGridLayoutAddWidget(layout, btn_clr_3,    13, 1, align_c)
+    guitk.BCGridLayoutAddWidget(layout, btn_hdr,      14, 0, align_c)
+    guitk.BCGridLayoutAddWidget(layout, btn_clr_4,    14, 1, align_c)
+    guitk.BCGridLayoutAddWidget(layout, btn_clear,    15, 0, align_c)
 
     guitk.BCShow(win)
     return 1
 
 
 # ---------------------------------------------------------------------------
-#  工具函数
+#  通用工具
 # ---------------------------------------------------------------------------
 def _warn(msg):
     try:
@@ -254,11 +246,9 @@ def _get_entity_name(ent):
 
 
 def _get_output_keyword():
-    """输入仍是 D/V/A，返回完整 Nastran 关键字。
-    返回 DISPLACEMENT / VELOCITY / ACCELERATION，默认 DISPLACEMENT。"""
     kind_w = _STATE.get('out_widget')
     if not kind_w:
-        return 'DISPLACEMENT'
+        return 'ACCELERATION'
     kind, w = kind_w
     txt = ''
     if kind == 'edit':
@@ -268,11 +258,13 @@ def _get_output_keyword():
             print('[DBG] BCLineEditGetText failed: {}'.format(e))
     low = str(txt).strip().lower()
     print('[DBG] Output type raw text = {!r}'.format(txt))
+    if low.startswith('d'):
+        return 'DISPLACEMENT'
     if low.startswith('v'):
         return 'VELOCITY'
     if low.startswith('a'):
         return 'ACCELERATION'
-    return 'DISPLACEMENT'
+    return 'ACCELERATION'
 
 
 def _dedupe_state():
@@ -317,7 +309,7 @@ def _set_entity_name_safe(ent, name):
 
 
 # ---------------------------------------------------------------------------
-#  ★ 新增：BULK 文本导入（对齐 IPI / VTF）
+#  BULK 文本导入
 # ---------------------------------------------------------------------------
 def _import_bulk_text(bulk_text, tag='bulk'):
     """把文本形式的 BULK 卡片通过 InputNastran 导入模型。"""
@@ -341,24 +333,22 @@ def _import_bulk_text(bulk_text, tag='bulk'):
 
 
 # ===========================================================================
-#  ★ v4-fix-merge-v2：_ensure_params_in_bulk 已弃用（保留函数体，但不再调用）
-#     原因：ANSA 把 PARAM / ACMODL 归到 Header 里，而 create_header 会删除
-#           所有旧 Header，导致之前导入的卡片一起被删。
-#           现在改为在 create_header 里直接写进 Header 文本。
+#  ★ v13-fix-merge-v2：_ensure_params_in_bulk 已弃用（保留函数体，但不再调用）
+#     原因：ANSA 把 PARAM 归到 Header 里，而 create_header 会删除所有旧 Header，
+#           导致之前导入的 PARAM 一起被删。现在改为在 create_header 里直接写。
 # ===========================================================================
 def _ensure_params_in_bulk():
     """【已弃用】不要调用此函数。
-    ★ v4-fix-merge-v2：PARAM + ACMODL 改为在 create_header 里直接写进 Header 文本。
+    ★ v13-fix-merge-v2：PARAM 改为在 create_header 里直接写进 Header 文本。
     """
-    print('[WARN] _ensure_params_in_bulk is deprecated in v4-fix-merge-v2')
+    print('[WARN] _ensure_params_in_bulk is deprecated in v13-fix-merge-v2')
     return
 
 
 # ===========================================================================
-#  ★ NSM 智能识别模块（v4-fix-merge-v2：InputNastran 导入 BULK）
+#  ★ NSM 智能识别模块（v13：改为 InputNastran 导入 BULK）
 # ===========================================================================
 def _nsm_get_sid_from_card(ent, field='SID'):
-    """从卡片安全读 SID。"""
     if ent is None:
         return None
     try:
@@ -376,7 +366,6 @@ def _nsm_get_sid_from_card(ent, field='SID'):
 
 
 def _nsm_collect_nsm_sids():
-    """扫描模型里所有 NSM 卡片的 SID（去重，保序）。"""
     sids = []
     for ent in _collect('NSM'):
         sid = _nsm_get_sid_from_card(ent, 'SID')
@@ -386,7 +375,6 @@ def _nsm_collect_nsm_sids():
 
 
 def _nsm_collect_nsmadd_sids():
-    """扫描模型里所有 NSMADD 卡片的 SID。"""
     sids = []
     for ent in _collect('NSMADD'):
         sid = _nsm_get_sid_from_card(ent, 'SID')
@@ -397,9 +385,9 @@ def _nsm_collect_nsmadd_sids():
 
 def _nsm_ensure_nsmadd():
     """
-    ★ v4-fix-merge-v2：智能识别 NSM / NSMADD。
+    ★ v13-fix-merge-v2：智能识别 NSM / NSMADD。
     返回 CEND 中 NSM 关键字使用的 SID（或 None）。
-    NSMADD 通过 InputNastran 导入 BULK（NSMADD 是独立实体，不会被删除 Header 时误删）。
+    NSMADD 通过 InputNastran 导入 BULK（独立实体，不会被删除 Header 时误删）。
     """
     nsm_sids = _nsm_collect_nsm_sids()
     nsmadd_sids = _nsm_collect_nsmadd_sids()
@@ -525,19 +513,6 @@ def _clear_response_data(w=None, data=None):
     try:
         print('[DBG] === Clear Response SET ===')
         n = 0
-        
-        # ★ 修复：优先删除内存状态中直接记录的 SET 实体
-        if _STATE.get('response_set') is not None:
-            try:
-                base.DeleteEntity(_STATE['response_set'])
-                n += 1
-                print('[DBG] Deleted response SET from _STATE.')
-            except Exception as e:
-                print('[DBG] delete SET from _STATE failed: {}'.format(e))
-            _STATE['response_set'] = None
-            _STATE['response_sid'] = None
-
-        # 兜底：按名字查找残余的 SET 并删除
         for _ in range(5):
             s = _find_set_by_name(RESPONSE_SET_NAME)
             if s is None:
@@ -545,16 +520,15 @@ def _clear_response_data(w=None, data=None):
             try:
                 base.DeleteEntity(s)
                 n += 1
-                print('[DBG] Deleted residual response SET by name.')
             except Exception as e:
-                print('[DBG] delete residual SET failed: {}'.format(e))
+                print('[DBG] delete response SET failed: {}'.format(e))
                 break
 
         _STATE['response_nids'] = set()
         _STATE['response_set'] = None
         _STATE['response_sid'] = None
         print('[DBG] Cleared {} response SET'.format(n))
-        _info('已清除 {} 个 NTF_RESPONSE SET，响应点列表已清空。'.format(n))
+        _info('已清除 {} 个 VTF_RESPONSE SET，响应点列表已清空。'.format(n))
     except Exception as e:
         import traceback
         print(traceback.format_exc())
@@ -623,124 +597,74 @@ def _next_free_sid(etype_list):
     return n
 
 
-def _allocate_ntf_sids():
-    """按类型独立分配 SID：
-       TABLED1 / TABDMP1(结构) / TABDMP1(流体) / FREQ1 / EIGRL(结构) / EIGRL(流体)
-    """
+def _allocate_common_sids():
     tabled_sid = _next_free_sid(['TABLED1', 'TABLED'])
-
-    used_tabdmp = _collect_used_sids(['TABDMP1', 'TABDMP', 'TABDMP0'])
-    tabdmp_struct = 1
-    while tabdmp_struct in used_tabdmp:
-        tabdmp_struct += 1
-    used_tabdmp.add(tabdmp_struct)
-    tabdmp_fluid = 1
-    while tabdmp_fluid in used_tabdmp:
-        tabdmp_fluid += 1
-
-    freq_sid = _next_free_sid(['FREQ1', 'FREQ'])
-
-    used_eigl = _collect_used_sids(['EIGRL', 'EIGR'])
-    eigl_struct = 1
-    while eigl_struct in used_eigl:
-        eigl_struct += 1
-    used_eigl.add(eigl_struct)
-    eigl_fluid = 1
-    while eigl_fluid in used_eigl:
-        eigl_fluid += 1
-
-    return {
-        'tabled':        tabled_sid,
-        'tabdmp_struct': tabdmp_struct,
-        'tabdmp_fluid':  tabdmp_fluid,
-        'freq':          freq_sid,
-        'eigl_struct':   eigl_struct,
-        'eigl_fluid':    eigl_fluid,
-    }
+    tabdmp_sid = _next_free_sid(['TABDMP1', 'TABDMP', 'TABDMP0'])
+    freq_sid   = _next_free_sid(['FREQ1', 'FREQ'])
+    eigl_sid   = _next_free_sid(['EIGRL', 'EIGR'])
+    return tabled_sid, tabdmp_sid, freq_sid, eigl_sid
 
 
-def _build_common_cards_nas(alloc, f1, df, ndf,
-                            damp_struct, v2_struct,
-                            damp_fluid, v2_fluid,
-                            tx1, ty1, tx2, ty2):
+def _build_common_cards_nas(tabled_sid, tabdmp_sid, freq_sid, eigl_sid,
+                            f1, df, ndf, damp, v2, tx1, ty1, tx2, ty2):
     lines = []
     lines.append('BEGIN BULK')
 
-    lines.append(_pad8('TABLED1') + _pad8(str(alloc['tabled'])) +
+    lines.append(_pad8('TABLED1') + _pad8(str(tabled_sid)) +
                  _pad8('LINEAR') + _pad8('LINEAR'))
     lines.append('+' + ' ' * 7 +
                  _pad8(tx1) + _pad8(ty1) +
                  _pad8(tx2) + _pad8(ty2))
     lines.append('+' + ' ' * 7 + _pad8('ENDT'))
 
-    lines.append(_pad8('TABDMP1') + _pad8(str(alloc['tabdmp_struct'])) + _pad8('G'))
+    lines.append(_pad8('TABDMP1') + _pad8(str(tabdmp_sid)) + _pad8('G'))
     lines.append('+' + ' ' * 7 +
-                 _pad8(tx1) + _pad8(damp_struct) +
-                 _pad8(tx2) + _pad8(damp_struct))
+                 _pad8(tx1) + _pad8(damp) +
+                 _pad8(tx2) + _pad8(damp))
     lines.append('+' + ' ' * 7 + _pad8('ENDT'))
 
-    lines.append(_pad8('TABDMP1') + _pad8(str(alloc['tabdmp_fluid'])) + _pad8('G'))
-    lines.append('+' + ' ' * 7 +
-                 _pad8(tx1) + _pad8(damp_fluid) +
-                 _pad8(tx2) + _pad8(damp_fluid))
-    lines.append('+' + ' ' * 7 + _pad8('ENDT'))
-
-    lines.append('FREQ1,{},{},{},{}'.format(
-        alloc['freq'], f1, df, ndf))
-    lines.append('EIGRL,{},0.0,{}'.format(
-        alloc['eigl_struct'], v2_struct))
-    lines.append('EIGRL,{},0.0,{}'.format(
-        alloc['eigl_fluid'], v2_fluid))
+    lines.append('FREQ1,{},{},{},{}'.format(freq_sid, f1, df, ndf))
+    lines.append('EIGRL,{},0.0,{}'.format(eigl_sid, v2))
     lines.append('ENDDATA')
     return '\n'.join(lines) + '\n'
 
 
-def _find_cards_in_model(allocated=None):
+def _find_cards_in_model():
     tabs = _collect('TABLED1') or _collect('TABLED')
     if tabs:
         _STATE['tabled_ent'] = tabs[0]
         print('[DBG] Found TABLED1: SID/TID={}'
               .format(_get_card_sid(tabs[0], 'TID', 'SID', 'ID')))
 
-    if allocated:
-        _STATE['tabdmp1_struct_tid'] = allocated['tabdmp_struct']
-        _STATE['tabdmp1_fluid_tid']  = allocated['tabdmp_fluid']
-        _STATE['freq1_sid']          = allocated['freq']
-        _STATE['eigl_struct_sid']    = allocated['eigl_struct']
-        _STATE['eigl_fluid_sid']     = allocated['eigl_fluid']
-        print('[DBG] 卡片 SID（按分配记录）：TABDMP1(S)={}, TABDMP1(F)={}, '
-              'FREQ1={}, EIGRL(S)={}, EIGRL(F)={}'
-              .format(allocated['tabdmp_struct'], allocated['tabdmp_fluid'],
-                      allocated['freq'],
-                      allocated['eigl_struct'], allocated['eigl_fluid']))
-    else:
-        tabdmps = _collect('TABDMP1') + _collect('TABDMP')
-        if len(tabdmps) >= 1:
-            _STATE['tabdmp1_struct_tid'] = _get_card_sid(
-                tabdmps[0], 'TID', 'SID', 'ID')
-        if len(tabdmps) >= 2:
-            _STATE['tabdmp1_fluid_tid'] = _get_card_sid(
-                tabdmps[1], 'TID', 'SID', 'ID')
+    for name in ('TABDMP1', 'TABDMP', 'TABDMP0'):
+        ents = _collect(name)
+        if ents:
+            sid = _get_card_sid(ents[0], 'TID', 'SID', 'ID')
+            _STATE['tabdmp1_tid'] = sid
+            print('[DBG] Found {}: SID/TID={}'.format(name, sid))
+            break
 
-        for name in ('FREQ1', 'FREQ'):
-            ents = _collect(name)
-            if ents:
-                _STATE['freq1_sid'] = _get_card_sid(ents[0], 'SID', 'TID', 'ID')
-                break
+    for name in ('FREQ1', 'FREQ'):
+        ents = _collect(name)
+        if ents:
+            sid = _get_card_sid(ents[0], 'SID', 'TID', 'ID')
+            _STATE['freq1_sid'] = sid
+            print('[DBG] Found {}: SID={}'.format(name, sid))
+            break
 
-        eigrls = _collect('EIGRL') + _collect('EIGR')
-        if len(eigrls) >= 1:
-            _STATE['eigl_struct_sid'] = _get_card_sid(
-                eigrls[0], 'SID', 'TID', 'ID')
-        if len(eigrls) >= 2:
-            _STATE['eigl_fluid_sid'] = _get_card_sid(
-                eigrls[1], 'SID', 'TID', 'ID')
+    for name in ('EIGRL', 'EIGR'):
+        ents = _collect(name)
+        if ents:
+            sid = _get_card_sid(ents[0], 'SID', 'TID', 'ID')
+            _STATE['eigl_sid'] = sid
+            print('[DBG] Found {}: SID={}'.format(name, sid))
+            break
 
 
 def init_common_cards(w, data):
     try:
         print('[DBG] ============================================')
-        print('[DBG] NTF Init Common Cards clicked')
+        print('[DBG] Init Common Cards clicked')
 
         model_dareas = _collect('DAREA')
         if not model_dareas and _STATE['dareas']:
@@ -749,7 +673,7 @@ def init_common_cards(w, data):
             _STATE['dareas'] = []
             _STATE['rload1s'] = []
 
-        freq_edit, ds_edit, es_edit, df_edit, ef_edit, tab_edit = data
+        freq_edit, damp_edit, eigl_edit, tab_edit = data
 
         text_freq = guitk.BCLineEditGetText(freq_edit)
         parts = [p.strip() for p in text_freq.split(',')]
@@ -758,24 +682,14 @@ def init_common_cards(w, data):
             return
         f1, df, ndf = float(parts[0]), float(parts[1]), int(float(parts[2]))
 
-        damp_struct = guitk.BCLineEditGetDouble(ds_edit)
-        if damp_struct <= 0:
-            _warn('结构阻尼比必须大于 0')
+        damp = guitk.BCLineEditGetDouble(damp_edit)
+        if damp <= 0:
+            _warn('阻尼比必须大于 0')
             return
 
-        v2_struct = guitk.BCLineEditGetDouble(es_edit)
-        if v2_struct <= 0:
-            _warn('结构 EIGRL 上限频率必须大于 0')
-            return
-
-        damp_fluid = guitk.BCLineEditGetDouble(df_edit)
-        if damp_fluid <= 0:
-            _warn('流体阻尼比必须大于 0')
-            return
-
-        v2_fluid = guitk.BCLineEditGetDouble(ef_edit)
-        if v2_fluid <= 0:
-            _warn('流体 EIGRL 上限频率必须大于 0')
+        v2 = guitk.BCLineEditGetDouble(eigl_edit)
+        if v2 <= 0:
+            _warn('EIGRL 上限频率必须大于 0')
             return
 
         text_tab = guitk.BCLineEditGetText(tab_edit)
@@ -785,10 +699,8 @@ def init_common_cards(w, data):
             return
         tx1, ty1, tx2, ty2 = [float(p) for p in parts_t]
 
-        print('[DBG] 参数：FREQ1=({},{},{}), damp_struct={}, V2_struct={}, '
-              'damp_fluid={}, V2_fluid={}, TABLED=({},{},{},{})'
-              .format(f1, df, ndf, damp_struct, v2_struct,
-                      damp_fluid, v2_fluid, tx1, ty1, tx2, ty2))
+        print('[DBG] 参数：FREQ1=({},{},{}), damp={}, V2={}, TABLED=({},{},{},{})'
+              .format(f1, df, ndf, damp, v2, tx1, ty1, tx2, ty2))
         print('[DBG] 当前输出类型：{}'.format(_get_output_keyword()))
 
         for etype in ('TABLED1', 'TABLED',
@@ -803,62 +715,50 @@ def init_common_cards(w, data):
                 except Exception as e:
                     print('[DBG] Delete {} failed: {}'.format(etype, e))
 
-        alloc = _allocate_ntf_sids()
-        print('[DBG] 分配 SID：TABLED1={}, TABDMP1(Struct)={}, '
-              'TABDMP1(Fluid)={}, FREQ1={}, EIGRL(Struct)={}, EIGRL(Fluid)={}'
-              .format(alloc['tabled'], alloc['tabdmp_struct'],
-                      alloc['tabdmp_fluid'], alloc['freq'],
-                      alloc['eigl_struct'], alloc['eigl_fluid']))
+        tabled_sid, tabdmp_sid, freq_sid, eigl_sid = _allocate_common_sids()
+        print('[DBG] 分配 SID：TABLED1={}, TABDMP1={}, FREQ1={}, EIGRL={}'
+              .format(tabled_sid, tabdmp_sid, freq_sid, eigl_sid))
 
         nas_text = _build_common_cards_nas(
-            alloc, f1, df, ndf,
-            damp_struct, v2_struct,
-            damp_fluid, v2_fluid,
-            tx1, ty1, tx2, ty2)
+            tabled_sid, tabdmp_sid, freq_sid, eigl_sid,
+            f1, df, ndf, damp, v2, tx1, ty1, tx2, ty2)
         print('[DBG] 生成 .nas 内容:')
         print(nas_text)
 
-        # ★ 统一走 _import_bulk_text（对齐 IPI / VTF）
-        _import_bulk_text(nas_text, 'ntf_init_cards')
+        # ★ 用统一入口导入（对齐 IPI）
+        _import_bulk_text(nas_text, 'init_cards')
 
-        _find_cards_in_model(alloc)
+        _find_cards_in_model()
 
-        # ★ v4-fix-merge-v2：移除此调用（PARAM + ACMODL 改由 create_header 写）
+        # ★ v13-fix-merge-v2：移除此调用（PARAM 改由 create_header 写）
         # _ensure_params_in_bulk()
 
         ok_count = sum([
-            1 if _STATE['tabled_ent']         else 0,
-            1 if _STATE['tabdmp1_struct_tid'] else 0,
-            1 if _STATE['tabdmp1_fluid_tid']  else 0,
-            1 if _STATE['freq1_sid']          else 0,
-            1 if _STATE['eigl_struct_sid']    else 0,
-            1 if _STATE['eigl_fluid_sid']     else 0,
+            1 if _STATE['tabled_ent']  else 0,
+            1 if _STATE['tabdmp1_tid'] else 0,
+            1 if _STATE['freq1_sid']   else 0,
+            1 if _STATE['eigl_sid']    else 0,
         ])
-        print('[DBG] 就绪：TABLED={}, TABDMP1(S)={}, TABDMP1(F)={}, '
-              'FREQ1={}, EIGRL(S)={}, EIGRL(F)={}'
+        print('[DBG] 就绪：TABLED={}, TABDMP={}, FREQ={}, EIGRL={}'
               .format(
-                  'OK' if _STATE['tabled_ent']         else 'MISSING',
-                  'OK' if _STATE['tabdmp1_struct_tid'] else 'MISSING',
-                  'OK' if _STATE['tabdmp1_fluid_tid']  else 'MISSING',
-                  'OK' if _STATE['freq1_sid']          else 'MISSING',
-                  'OK' if _STATE['eigl_struct_sid']    else 'MISSING',
-                  'OK' if _STATE['eigl_fluid_sid']     else 'MISSING',
+                  'OK' if _STATE['tabled_ent']  else 'MISSING',
+                  'OK' if _STATE['tabdmp1_tid'] else 'MISSING',
+                  'OK' if _STATE['freq1_sid']   else 'MISSING',
+                  'OK' if _STATE['eigl_sid']    else 'MISSING',
               ))
 
-        if ok_count == 6:
-            _info('NTF 公共卡片初始化成功。')
+        if ok_count == 4:
+            _info('公共卡片初始化成功。')
         else:
-            _warn('只有 {} / 6 张卡片导入成功。'.format(ok_count))
-
+            _warn('只有 {} / 4 张卡片导入成功。'.format(ok_count))
     except Exception as e:
         import traceback
-        print('[ERR] init_common_cards exception:')
         print(traceback.format_exc())
         _warn('初始化失败：{}'.format(e))
 
 
 # ---------------------------------------------------------------------------
-#  Load Set 创建 / 匿名清理
+#  Load Set 创建
 # ---------------------------------------------------------------------------
 def _create_loadset(name):
     try:
@@ -939,7 +839,7 @@ def _cleanup_anonymous_loadsets():
 
 
 # ---------------------------------------------------------------------------
-#  [1] DAREA Nodes —— 激励点
+#  [1] DAREA Nodes
 # ---------------------------------------------------------------------------
 def _create_darea(nid, c_str, loadset, darea_name):
     fields = {
@@ -1012,11 +912,10 @@ def _print_picked_nodes(nodes):
 
 
 def on_darea_nodes(w, data):
-    """[1] 左键：拾取激励点 → 每节点建 Fx/Fy/Fz 三个 DAREA。
-    拾取后剔除已处理的 NID。"""
+    """[1] 左键：拾取激励点 → 每节点建 Fx/Fy/Fz 三个 DAREA。"""
     try:
         print('[DBG] ============================================')
-        print('[DBG] NTF DAREA Nodes (Excitation) clicked')
+        print('[DBG] VTF DAREA Nodes (Excitation) clicked')
         _cleanup_anonymous_loadsets()
 
         nodes = _pick_grids()
@@ -1079,7 +978,6 @@ def on_darea_nodes(w, data):
               .format(total, len(new_nids), len(_STATE['dareas'])))
     except Exception as e:
         import traceback
-        print('[ERR] on_darea_nodes exception:')
         print(traceback.format_exc())
         _warn('DAREA Nodes 操作失败：{}'.format(e))
 
@@ -1116,7 +1014,7 @@ def create_rload1(w, data):
     """[2] 左键：为未关联的 DAREA 建 RLOAD1。"""
     try:
         print('[DBG] ============================================')
-        print('[DBG] NTF Create RLOAD clicked')
+        print('[DBG] Create RLOAD clicked')
         _dedupe_state()
 
         if not _STATE['dareas']:
@@ -1159,13 +1057,12 @@ def create_rload1(w, data):
               .format(count, len(_STATE['rload1s'])))
     except Exception as e:
         import traceback
-        print('[ERR] create_rload1 exception:')
         print(traceback.format_exc())
         _warn('Create RLOAD 失败：{}'.format(e))
 
 
 # ---------------------------------------------------------------------------
-#  Response SET 支持 —— NTF 用"单一共享 SET"
+#  Response SET 支持
 # ---------------------------------------------------------------------------
 def _find_grid_by_nid(nid):
     for g in _collect('GRID'):
@@ -1233,7 +1130,13 @@ def _delete_response_set():
 
 
 def _rebuild_response_set():
-    """全量重建 NTF_RESPONSE SET。"""
+    """全量重建 VTF_RESPONSE SET。
+    分步创建 + 多重 API 兜底，兼容 ANSA V21.1.5。
+
+    ★ v13-fix-merge-v3：AddToSet 由「一次性传列表」改为「逐个 GRID 调用」。
+       原因：某些 ANSA 版本对 AddToSet(set, [list]) 不报错但只加第一个实体，
+             导致框选多个响应点时 SET 里只写进 1 个点。
+    """
     _delete_response_set()
 
     if not _STATE['response_nids']:
@@ -1256,43 +1159,53 @@ def _rebuild_response_set():
         print('[DBG] SetEntityCardValues SID failed: {}'.format(e))
 
     if not _set_entity_name_safe(set_ent, RESPONSE_SET_NAME):
-        print('[WARN] Cannot set name for SET {!r}, will still keep it'
+        print('[ERR] Cannot set name for SET {!r}, will delete'
               .format(RESPONSE_SET_NAME))
-
-    # ★ 修复优化：建立 NID -> GRID 映射，避免循环调用 _find_grid_by_nid 导致卡顿
-    all_grids = _collect('GRID')
-    grid_map = {}
-    for g in all_grids:
         try:
-            nid = base.GetEntityCardValues(constants.NASTRAN, g, ('NID',)).get('NID')
-            if nid is not None:
-                grid_map[nid] = g
+            base.DeleteEntity(set_ent)
         except Exception:
             pass
+        return
 
     grids = []
     for nid in sorted(_STATE['response_nids']):
-        g = grid_map.get(nid)
+        g = _find_grid_by_nid(nid)
         if g is not None:
             grids.append(g)
         else:
             print('[WARN] Response GRID NID={} not found'.format(nid))
 
     if grids:
-        added_count = 0
-        # ★ 修复：逐个加入，解决 ANSA 某些版本 AddToSet 传列表失败只加第一个的问题
+        # ★ v13-fix-merge-v3：逐个添加，避免一次性传列表时"静默只加第一个"
+        n_added = 0
         for g in grids:
-            try:
-                base.AddToSet(set_ent, g)
-                added_count += 1
-            except Exception as e:
-                print('[DBG] AddToSet failed for grid NID={}: {}'.format(
-                    base.GetEntityCardValues(constants.NASTRAN, g, ('NID',)).get('NID', '?'), e))
+            ok_one = False
+            for call in (
+                lambda gg=g: base.AddToSet(set_ent, gg),
+                lambda gg=g: base.AddToSet(set_ent, [gg]),
+            ):
+                try:
+                    call()
+                    ok_one = True
+                    break
+                except Exception as e:
+                    print('[DBG] AddToSet variant failed: {}'.format(e))
+            if ok_one:
+                n_added += 1
+            else:
+                try:
+                    nid_dbg = base.GetEntityCardValues(
+                        constants.NASTRAN, g, ('NID',)).get('NID')
+                except Exception:
+                    nid_dbg = '?'
+                print('[WARN] AddToSet failed for GRID NID={}'
+                      .format(nid_dbg))
 
-        if added_count == 0:
-            print('[ERR] AddToSet failed for all grids in {}'.format(RESPONSE_SET_NAME))
-        else:
-            print('[DBG] Successfully added {} grids to SET'.format(added_count))
+        print('[DBG] AddToSet: {}/{} grids added to {}'
+              .format(n_added, len(grids), RESPONSE_SET_NAME))
+        if n_added != len(grids):
+            print('[ERR] {} SET 只加入了 {}/{} 个节点'
+                  .format(RESPONSE_SET_NAME, n_added, len(grids)))
 
     actual = _get_card_sid(set_ent, 'SID', 'ID')
     try:
@@ -1310,14 +1223,12 @@ def _rebuild_response_set():
 
 
 # ---------------------------------------------------------------------------
-#  [3] Response Nodes —— 声腔响应点
+#  [3] Response Nodes
 # ---------------------------------------------------------------------------
 def on_response_nodes(w, data):
-    """[3] 左键：拾取声腔节点 → 累积到 NTF_RESPONSE SET。
-    set 天然去重。"""
     try:
         print('[DBG] ============================================')
-        print('[DBG] NTF Response Nodes (Cavity) clicked')
+        print('[DBG] Response Nodes clicked')
 
         nodes = _pick_grids()
         print('[DBG] picked GRID count = {}'.format(len(nodes)))
@@ -1328,54 +1239,39 @@ def on_response_nodes(w, data):
         nid_list = _print_picked_nodes(nodes)
 
         added = 0
-        non_fluid = 0
         for nid in nid_list:
-            try:
-                node = _find_grid_by_nid(nid)
-                if node is not None:
-                    cd = base.GetEntityCardValues(
-                        constants.NASTRAN, node, ('CD',)).get('CD')
-                    if cd is not None and int(cd) != -1:
-                        non_fluid += 1
-            except Exception:
-                pass
             if nid not in _STATE['response_nids']:
                 _STATE['response_nids'].add(nid)
                 added += 1
-
-        if non_fluid > 0:
-            print('[WARN] 有 {} 个响应点 CD != -1，可能不是流体声腔节点'
-                  .format(non_fluid))
 
         print('[DBG] 本次新增 {} 个响应点，累计 {}'.format(
             added, len(_STATE['response_nids'])))
 
         _rebuild_response_set()
 
-        _info('本次拾取 {} 个节点，其中 {} 个为新增声腔响应点。\n'
-              '当前累计 {} 个响应点，NTF_RESPONSE SET SID = {}。'
+        _info('本次拾取 {} 个节点，其中 {} 个为新增响应点。\n'
+              '当前累计 {} 个响应点，VTF_RESPONSE SET SID = {}。'
               .format(len(nid_list), added,
                       len(_STATE['response_nids']),
                       _STATE['response_sid']))
     except Exception as e:
         import traceback
-        print('[ERR] on_response_nodes exception:')
         print(traceback.format_exc())
         _warn('Response Nodes 操作失败：{}'.format(e))
 
 
 # ---------------------------------------------------------------------------
-#  [4] Create Header（★ v4-fix-merge-v2：PARAM + ACMODL 直接写进 Header 文本）
+#  [4] Create Header（★ v13-fix-merge-v2：PARAM 直接写进 Header 文本）
 # ---------------------------------------------------------------------------
 def create_header(w, data):
-    """[4] 写 SOL 111 NTF Header（只写 CEND 段 + PARAM/ACMODL 追加）。
+    """[4] 写 SOL 111 VTF Header（只写 CEND 段 + PARAM 追加）。
 
-    ★ v4-fix-merge-v2 修复：
-        · PARAM + ACMODL 直接写进 Header 文本（放在 SUBCASE 之后）
+    ★ v13-fix-merge-v2 修复：
+        · PARAM 直接写进 Header 文本（放在 SUBCASE 之后）
         · 移除 _ensure_params_in_bulk() 调用
-          —— 因为 ANSA 把 PARAM/ACMODL 归到 Header 里，
+          —— 因为 ANSA 把 PARAM 归到 Header 里，
              而此函数会删除所有旧 Header，
-             导致之前导入的卡片一起被删。
+             导致之前导入的 PARAM 一起被删。
         · NSMADD 保持走 InputNastran（NSMADD 是独立实体，不会丢）
     """
     try:
@@ -1384,12 +1280,10 @@ def create_header(w, data):
         if not _STATE['rload1s']:
             _warn('请先执行 "2. Create RLOAD"。')
             return
-        if (_STATE['freq1_sid']          is None or
-            _STATE['eigl_struct_sid']    is None or
-            _STATE['eigl_fluid_sid']     is None or
-            _STATE['tabdmp1_struct_tid'] is None or
-            _STATE['tabdmp1_fluid_tid']  is None):
-            _warn('模型里缺少 FREQ1 / TABDMP1 / EIGRL（结构或流体）。\n'
+        if (_STATE['freq1_sid']   is None or
+            _STATE['eigl_sid']    is None or
+            _STATE['tabdmp1_tid'] is None):
+            _warn('模型里缺少 FREQ1 / TABDMP1 / EIGRL。\n'
                   '请先点 "0. Init Common Cards"。')
             return
         if not _STATE['response_nids']:
@@ -1400,7 +1294,7 @@ def create_header(w, data):
 
         resp_sid = _STATE['response_sid']
         if resp_sid is None:
-            _warn('NTF_RESPONSE SET 未建立，无法写 Header。')
+            _warn('VTF_RESPONSE SET 未建立，无法写 Header。')
             return
 
         out_kw = _get_output_keyword()
@@ -1408,13 +1302,14 @@ def create_header(w, data):
         print('[DBG] 响应 SET SID = {}, 响应点数 = {}'
               .format(resp_sid, len(_STATE['response_nids'])))
 
-        # ★ v4-fix-merge-v2：移除 _ensure_params_in_bulk() 调用
+        # ★ v13-fix-merge-v2：移除 _ensure_params_in_bulk() 调用
         # _ensure_params_in_bulk()
 
         # NSMADD 走 InputNastran（独立实体，不会被删除 Header 时误删）
         nsm_sid = _nsm_ensure_nsmadd()
         print('[DBG] NSM SID（用于 CEND）= {}'.format(nsm_sid))
 
+        # 删除旧 Header
         headers = _collect('Nastran Header')
         print('[DBG] 发现已有 Header 数量：{}'.format(len(headers)))
         for h in headers:
@@ -1430,7 +1325,7 @@ def create_header(w, data):
             _warn('Header 创建失败。')
             return
 
-        # ---- ★ 只写 CEND 段 + PARAM/ACMODL 追加 ----
+        # ---- ★ 只写 CEND 段 + PARAM 追加 ----
         lines = [
             'SOL 111',
             'CEND',
@@ -1441,10 +1336,8 @@ def create_header(w, data):
         if nsm_sid is not None:
             lines.append('NSM = {}'.format(nsm_sid))
         lines.append('$')
-        lines.append('METHOD(STRUCTURE) = {}'.format(_STATE['eigl_struct_sid']))
-        lines.append('METHOD(FLUID)     = {}'.format(_STATE['eigl_fluid_sid']))
-        lines.append('SDAMPING(STRUCTURE) = {}'.format(_STATE['tabdmp1_struct_tid']))
-        lines.append('SDAMPING(FLUID)     = {}'.format(_STATE['tabdmp1_fluid_tid']))
+        lines.append('METHOD(STRUCTURE) = {}'.format(_STATE['eigl_sid']))
+        lines.append('SDAMPING(STRUCTURE) = {}'.format(_STATE['tabdmp1_tid']))
         lines.append('$')
 
         for idx, rload in enumerate(_STATE['rload1s'], start=1):
@@ -1454,24 +1347,17 @@ def create_header(w, data):
             lines.append(
                 '{}(SORT2, PUNCH, PHASE) = {}'.format(out_kw, resp_sid))
 
-        # ★ v4-fix-merge-v2：PARAM + ACMODL 直接追加在 Header 文本末尾
-        #   （ANSA 导出时会自动把 PARAM/ACMODL 放到 .bdf 的 BULK 段正确位置）
+        # ★ v13-fix-merge-v2：PARAM 直接追加在 Header 文本末尾
+        #   （ANSA 导出时会自动把 PARAM 放到 .bdf 的 BULK 段正确位置）
         lines.append('$')
-        lines.append('PARAM,DBALL,SCRATCH')
-        lines.append('PARAM,COUPMASS,1')
-        lines.append('PARAM,TINY,0.')
-        lines.append('PARAM,EST,-1')
-        lines.append('PARAM,MAXRATIO,5.E8')
-        lines.append('PARAM,EPPRT,5.E-8')
-        lines.append('PARAM,GRDPNT,0')
-        lines.append('PARAM,K6ROT,100.0')
-        lines.append('PARAM,SNORM,20.0')
+        lines.append('PARAM,FASTFR,AUTO')
+        lines.append('PARAM,POST,-1')
+        lines.append('PARAM,AMSES,YES')
         lines.append('PARAM,AUTOSPC,YES')
-        lines.append('PARAM,SKINOUT,PUNCH')
-        lines.append('ACMODL,DIFF')
+        lines.append('PARAM,CHECKEL,YES')
 
         text = '\n'.join(lines)
-        print('[DBG] Header（只写 CEND + PARAM/ACMODL）:\n{}'.format(text))
+        print('[DBG] Header（只写 CEND + PARAM）:\n{}'.format(text))
 
         base.SetNastranHeaderText(header, text)
         base.SetCurrentEntity(header)
@@ -1479,30 +1365,24 @@ def create_header(w, data):
         nsm_msg = ('NSM = {}'.format(nsm_sid)
                    if nsm_sid is not None else '无')
 
-        _info('NTF Header 写入完成（v4-fix-merge-v2）：\n'
+        _info('VTF Header 写入完成（v13-fix-merge-v3）：\n'
               '  SUBCASE 数        = {}\n'
-              '  响应 SET SID      = {}（{} 个声腔点，共享）\n'
+              '  响应 SET SID      = {}（{} 个响应点，共享）\n'
               '  输出类型          = {}\n'
               '  METHOD(STRUCTURE) = {}\n'
-              '  METHOD(FLUID)     = {}\n'
               '  SDAMPING(STRUCT)  = {}\n'
-              '  SDAMPING(FLUID)   = {}\n'
               '  FREQ              = {}\n'
               '  {}\n'
-              '  PARAM             = DBALL / COUPMASS / TINY / EST / MAXRATIO / EPPRT / GRDPNT / K6ROT / SNORM / AUTOSPC / SKINOUT（写入 Header）\n'
-              '  ACMODL            = DIFF（写入 Header）'
+              '  PARAM             = FASTFR / POST=-1 / AMSES / AUTOSPC / CHECKEL（写入 Header）'
               .format(len(_STATE['rload1s']),
                       resp_sid,
                       len(_STATE['response_nids']),
                       out_kw,
-                      _STATE['eigl_struct_sid'],
-                      _STATE['eigl_fluid_sid'],
-                      _STATE['tabdmp1_struct_tid'],
-                      _STATE['tabdmp1_fluid_tid'],
+                      _STATE['eigl_sid'],
+                      _STATE['tabdmp1_tid'],
                       _STATE['freq1_sid'],
                       nsm_msg))
     except Exception as e:
         import traceback
-        print('[ERR] create_header exception:')
         print(traceback.format_exc())
         _warn('Create Header 失败：{}'.format(e))
